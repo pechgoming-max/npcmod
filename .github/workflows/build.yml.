@@ -1,0 +1,273 @@
+# ============================================================================
+# .github/workflows/build.yml
+# Fabric 1.20.1 - CS & Duels Modu CI/CD İş Akışı
+# ============================================================================
+# Bu iş akışı şunları yapar:
+#   1. Her push ve PR'da modu derler (Fabric + isteğe bağlı Forge matrisi)
+#   2. Gradle önbelleğini kullanarak derleme süresini kısaltır
+#   3. Derlenen JAR'ın boyutunu kontrol eder (2 MB – 5 MB aralığı)
+#   4. Etiket (tag) push'larında Modrinth, CurseForge ve GitHub Releases'e yayınlar
+#   5. Hata durumunda detaylı log ve artifact çıktısı sağlar
+# ============================================================================
+
+name: "Fabric 1.20.1 | CS & Duels Mod Build & Release"
+
+# ---------------------------------------------------------------------------
+# Tetikleyiciler
+# ---------------------------------------------------------------------------
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - "feature/**"
+    tags:
+      - "v*"          # v1.0.0, v1.2.3 gibi etiketlerde yayınlama tetiklenir
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Sonucu Modrinth/CurseForge'a yayınla (sadece tag push'larında önerilir)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+# ---------------------------------------------------------------------------
+# Küresel Ortam Değişkenleri
+# ---------------------------------------------------------------------------
+env:
+  # Java ve Gradle
+  JAVA_VERSION: "17"
+  GRADLE_VERSION: "8.5"
+  # Minecraft / Mod
+  MC_VERSION: "1.20.1"
+  MOD_NAME: "cs-duels-fabric"
+  MOD_DISPLAY_NAME: "CS & Duels Mod"
+  # Yayınlama (sadece tag push'larında kullanılır)
+  MODRINTH_PROJECT_ID: ${{ secrets.MODRINTH_PROJECT_ID }}
+  CURSEFORGE_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+  CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+  # Artifact boyut aralığı (MB)
+  MIN_JAR_SIZE_MB: 2
+  MAX_JAR_SIZE_MB: 5
+
+# ---------------------------------------------------------------------------
+# İşler
+# ---------------------------------------------------------------------------
+jobs:
+  # =========================================================================
+  # 1. DERLEME (Build) – Matris: Fabric + (isteğe bağlı Forge)
+  # =========================================================================
+  build:
+    name: "Derle (${{ matrix.platform }} | MC ${{ env.MC_VERSION }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - fabric
+          # - forge   # Forge desteği istersen yorumu kaldır
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      - name: "📥 Depoyu Klonla"
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: "🔍 Ortam Bilgilerini Göster"
+        run: |
+          echo "Platform: ${{ matrix.platform }}"
+          echo "Minecraft: ${{ env.MC_VERSION }}"
+          echo "Java: ${{ env.JAVA_VERSION }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+
+      - name: "☕ Java ${{ env.JAVA_VERSION }} Kurulumu"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "gradle"
+
+      - name: "⚙️ Gradle Wrapper'ı Çalıştırılabilir Yap"
+        run: chmod +x ./gradlew
+
+      - name: "🔐 Gradle Wrapper Doğrulaması"
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: "📦 Gradle Önbelleğini Yükle"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/loom-cache
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle-wrapper.properties', '**/*.gradle*', '**/gradle.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: "🧹 Temizle ve Derle (Clean + Build)"
+        run: |
+          ./gradlew clean
+          ./gradlew :${{ matrix.platform }}:build --no-daemon --stacktrace
+
+      - name: "📊 JAR Dosyasını Bul ve Boyutunu Kontrol Et"
+        id: jar_check
+        run: |
+          JAR_PATH=$(find ${{ matrix.platform }}/build/libs -name "*.jar" ! -name "*-sources.jar" ! -name "*-dev.jar" | head -n 1)
+          if [ -z "$JAR_PATH" ]; then
+            echo "::error::JAR dosyası bulunamadı!"
+            exit 1
+          fi
+          JAR_SIZE_BYTES=$(stat -c%s "$JAR_PATH")
+          JAR_SIZE_MB=$(echo "scale=2; $JAR_SIZE_BYTES / 1048576" | bc)
+          echo "Bulunan JAR: $JAR_PATH"
+          echo "Boyut: ${JAR_SIZE_MB} MB"
+          echo "jar_path=$JAR_PATH" >> $GITHUB_OUTPUT
+          echo "jar_size_mb=$JAR_SIZE_MB" >> $GITHUB_OUTPUT
+
+          # 2 MB – 5 MB aralığı kontrolü
+          if (( $(echo "$JAR_SIZE_MB < ${{ env.MIN_JAR_SIZE_MB }}" | bc -l) )); then
+            echo "::warning::JAR boyutu (${JAR_SIZE_MB} MB) beklenen alt sınırın (${{ env.MIN_JAR_SIZE_MB }} MB) altında. Mod çok küçük olabilir."
+          fi
+          if (( $(echo "$JAR_SIZE_MB > ${{ env.MAX_JAR_SIZE_MB }}" | bc -l) )); then
+            echo "::warning::JAR boyutu (${JAR_SIZE_MB} MB) beklenen üst sınırın (${{ env.MAX_JAR_SIZE_MB }} MB) üzerinde. Gereksiz dosyalar olabilir."
+          fi
+
+      - name: "📤 Derleme Çıktısını Artifact Olarak Yükle"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "${{ env.MOD_NAME }}-${{ matrix.platform }}-${{ github.sha }}"
+          path: ${{ steps.jar_check.outputs.jar_path }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 6
+
+      - name: "🧪 Testleri Çalıştır"
+        run: ./gradlew :${{ matrix.platform }}:test --no-daemon
+        continue-on-error: true   # Testler başarısız olsa bile derleme devam etsin (isteğe bağlı)
+
+      - name: "📋 Derleme Özeti"
+        run: |
+          echo "### ✅ Derleme Başarılı" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** ${{ matrix.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Minecraft:** ${{ env.MC_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **JAR:** \`${{ steps.jar_check.outputs.jar_path }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Boyut:** ${{ steps.jar_check.outputs.jar_size_mb }} MB" >> $GITHUB_STEP_SUMMARY
+
+  # =========================================================================
+  # 2. YAYINLAMA (Publish) – Sadece Tag Push'larında Çalışır
+  # =========================================================================
+  publish:
+    name: "Yayınla (Modrinth + CurseForge + GitHub Releases)"
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # GitHub Releases oluşturmak için
+
+    steps:
+      - name: "📥 Depoyu Klonla"
+        uses: actions/checkout@v4
+
+      - name: "☕ Java ${{ env.JAVA_VERSION }} Kurulumu"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: "gradle"
+
+      - name: "⚙️ Gradle Wrapper'ı Çalıştırılabilir Yap"
+        run: chmod +x ./gradlew
+
+      - name: "📦 Gradle Önbelleğini Yükle"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-publish-${{ hashFiles('**/gradle-wrapper.properties') }}
+
+      - name: "🔨 Yayın JAR'ını Derle"
+        run: ./gradlew clean build --no-daemon
+
+      - name: "🚀 Modrinth'e Yükle"
+        uses: Kir-Antipov/mc-publish@v3
+        with:
+          modrinth-id: ${{ env.MODRINTH_PROJECT_ID }}
+          modrinth-token: ${{ secrets.MODRINTH_TOKEN }}
+          name: "${{ env.MOD_DISPLAY_NAME }} ${{ github.ref_name }}"
+          version: "${{ github.ref_name }}"
+          version-type: "release"
+          changelog-file: "CHANGELOG.md"
+          loaders: fabric
+          game-versions: ${{ env.MC_VERSION }}
+          java: ${{ env.JAVA_VERSION }}
+          files: "fabric/build/libs/*.jar"
+        continue-on-error: true
+
+      - name: "🚀 CurseForge'a Yükle"
+        uses: Kir-Antipov/mc-publish@v3
+        with:
+          curseforge-id: ${{ env.CURSEFORGE_PROJECT_ID }}
+          curseforge-token: ${{ env.CURSEFORGE_API_KEY }}
+          name: "${{ env.MOD_DISPLAY_NAME }} ${{ github.ref_name }}"
+          version: "${{ github.ref_name }}"
+          version-type: "release"
+          changelog-file: "CHANGELOG.md"
+          loaders: fabric
+          game-versions: ${{ env.MC_VERSION }}
+          java: ${{ env.JAVA_VERSION }}
+          files: "fabric/build/libs/*.jar"
+        continue-on-error: true
+
+      - name: "🏷️ GitHub Release Oluştur"
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "${{ env.MOD_DISPLAY_NAME }} ${{ github.ref_name }}"
+          body_path: "CHANGELOG.md"
+          files: |
+            fabric/build/libs/*.jar
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # =========================================================================
+  # 3. KOD KALİTE KONTROLÜ (Lint) – İsteğe Bağlı
+  # =========================================================================
+  lint:
+    name: "Kod Kalitesi (Checkstyle + PMD)"
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: "📥 Depoyu Klonla"
+        uses: actions/checkout@v4
+
+      - name: "☕ Java ${{ env.JAVA_VERSION }} Kurulumu"
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: "⚙️ Gradle Wrapper'ı Çalıştırılabilir Yap"
+        run: chmod +x ./gradlew
+
+      - name: "🔍 Checkstyle Çalıştır"
+        run: ./gradlew checkstyleMain checkstyleTest --no-daemon
+        continue-on-error: true
+
+      - name: "🔍 PMD Çalıştır"
+        run: ./gradlew pmdMain pmdTest --no-daemon
+        continue-on-error: true
