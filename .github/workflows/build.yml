@@ -1,0 +1,392 @@
+name: build
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p $(dirname settings.gradle)
+          cat > settings.gradle <<'NPCEOF'
+          pluginManagement {
+              repositories {
+                  maven { url 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+              }
+          }
+          NPCEOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'NPCEOF'
+          org.gradle.jvmargs=-Xmx2G
+          NPCEOF
+          mkdir -p $(dirname build.gradle)
+          cat > build.gradle <<'NPCEOF'
+          plugins { id 'fabric-loom' version '1.5-SNAPSHOT' }
+          version = '1.0.0'
+          group = 'com.orhan'
+          base { archivesName = 'npcmod' }
+          dependencies {
+              minecraft "com.mojang:minecraft:1.20.1"
+              mappings "net.fabricmc:yarn:1.20.1+build.10:v2"
+              modImplementation "net.fabricmc:fabric-loader:0.15.11"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:0.92.2+1.20.1"
+          }
+          tasks.withType(JavaCompile).configureEach { options.release = 17 }
+          java { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+          NPCEOF
+          mkdir -p $(dirname src/main/resources/fabric.mod.json)
+          cat > src/main/resources/fabric.mod.json <<'NPCEOF'
+          {
+            "schemaVersion": 1,
+            "id": "npcmod",
+            "version": "1.0.0",
+            "name": "AI NPC",
+            "description": "Groq destekli sesli NPC",
+            "environment": "client",
+            "entrypoints": { "client": ["com.orhan.npcmod.NpcMod"] },
+            "depends": { "fabricloader": ">=0.15.0", "minecraft": "~1.20.1", "java": ">=17", "fabric-api": "*" }
+          }
+          NPCEOF
+          mkdir -p $(dirname src/main/resources/assets/npcmod/lang/en_us.json)
+          cat > src/main/resources/assets/npcmod/lang/en_us.json <<'NPCEOF'
+          { "key.npcmod.talk": "NPC Talk (hold)", "category.npcmod": "AI NPC" }
+          NPCEOF
+          mkdir -p $(dirname src/main/java/com/orhan/npcmod/Recorder.java)
+          cat > src/main/java/com/orhan/npcmod/Recorder.java <<'NPCEOF'
+          package com.orhan.npcmod;
+          
+          import javax.sound.sampled.*;
+          import java.io.*;
+          
+          public class Recorder {
+              static final AudioFormat FMT = new AudioFormat(16000f, 16, 1, true, false);
+              static TargetDataLine line;
+              static ByteArrayOutputStream out;
+              static Thread t;
+              static volatile boolean run;
+          
+              public static boolean start() {
+                  try {
+                      line = AudioSystem.getTargetDataLine(FMT);
+                      line.open(FMT);
+                      line.start();
+                      out = new ByteArrayOutputStream();
+                      run = true;
+                      t = new Thread(() -> {
+                          byte[] b = new byte[4096];
+                          while (run) {
+                              int n = line.read(b, 0, b.length);
+                              if (n > 0) out.write(b, 0, n);
+                          }
+                      });
+                      t.start();
+                      return true;
+                  } catch (Throwable e) {
+                      return false;
+                  }
+              }
+          
+              public static byte[] stop() {
+                  run = false;
+                  try { t.join(500); } catch (Exception ignored) {}
+                  try { line.stop(); line.close(); } catch (Exception ignored) {}
+                  return out.toByteArray();
+              }
+          
+              public static byte[] wav(byte[] pcm) throws IOException {
+                  AudioInputStream ais = new AudioInputStream(new ByteArrayInputStream(pcm), FMT, pcm.length / 2);
+                  ByteArrayOutputStream o = new ByteArrayOutputStream();
+                  AudioSystem.write(ais, AudioFileFormat.Type.WAVE, o);
+                  return o.toByteArray();
+              }
+          }
+          NPCEOF
+          mkdir -p $(dirname src/main/java/com/orhan/npcmod/Gemini.java)
+          cat > src/main/java/com/orhan/npcmod/Gemini.java <<'NPCEOF'
+          package com.orhan.npcmod;
+          
+          import com.google.gson.*;
+          import javax.sound.sampled.*;
+          import java.net.URI;
+          import java.net.http.*;
+          import java.time.Duration;
+          import java.util.Base64;
+          import java.util.List;
+          
+          public class Gemini {
+              static final String BASE = "https://generativelanguage.googleapis.com/v1beta/models/";
+              static final HttpClient HTTP = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build();
+          
+              static JsonObject textPart(String t) {
+                  JsonObject p = new JsonObject();
+                  p.addProperty("text", t);
+                  return p;
+              }
+          
+              static JsonObject content(String role, JsonObject part) {
+                  JsonObject c = new JsonObject();
+                  if (role != null) c.addProperty("role", role);
+                  JsonArray a = new JsonArray();
+                  a.add(part);
+                  c.add("parts", a);
+                  return c;
+              }
+          
+              static JsonObject post(String key, String model, JsonObject body) throws Exception {
+                  HttpRequest req = HttpRequest.newBuilder(URI.create(BASE + model + ":generateContent"))
+                          .timeout(Duration.ofSeconds(90))
+                          .header("x-goog-api-key", key)
+                          .header("Content-Type", "application/json")
+                          .POST(HttpRequest.BodyPublishers.ofString(body.toString())).build();
+                  HttpResponse<String> r = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+                  if (r.statusCode() != 200) {
+                      String b = r.body();
+                      if (b.length() > 250) b = b.substring(0, 250);
+                      throw new RuntimeException("Gemini " + r.statusCode() + ": " + b);
+                  }
+                  return JsonParser.parseString(r.body()).getAsJsonObject();
+              }
+          
+              static JsonArray parts(JsonObject res) {
+                  return res.getAsJsonArray("candidates").get(0).getAsJsonObject()
+                          .getAsJsonObject("content").getAsJsonArray("parts");
+              }
+          
+              /** returns {heard, reply}. history rows are {"user"|"model", text} */
+              public static String[] chat(String key, String model, String lang, List<String[]> history,
+                                          String userText, byte[] wav) throws Exception {
+                  String sys = "You are a friendly villager NPC living in a Minecraft world. Always speak and reply in "
+                          + lang + ". Reply with at most 2 short sentences and no emojis. "
+                          + "Output ONLY JSON: {\"heard\": the exact words the user said, \"reply\": your reply}.";
+                  JsonObject body = new JsonObject();
+                  body.add("systemInstruction", content(null, textPart(sys)));
+                  JsonArray contents = new JsonArray();
+                  int from = Math.max(0, history.size() - 12);
+                  for (int i = from; i < history.size(); i++)
+                      contents.add(content(history.get(i)[0], textPart(history.get(i)[1])));
+                  JsonObject last = new JsonObject();
+                  last.addProperty("role", "user");
+                  JsonArray lp = new JsonArray();
+                  if (wav != null) {
+                      JsonObject inline = new JsonObject();
+                      inline.addProperty("mimeType", "audio/wav");
+                      inline.addProperty("data", Base64.getEncoder().encodeToString(wav));
+                      JsonObject ap = new JsonObject();
+                      ap.add("inlineData", inline);
+                      lp.add(ap);
+                      lp.add(textPart("This is the user's spoken message. Answer it."));
+                  } else {
+                      lp.add(textPart(userText));
+                  }
+                  last.add("parts", lp);
+                  contents.add(last);
+                  body.add("contents", contents);
+                  JsonObject gc = new JsonObject();
+                  gc.addProperty("responseMimeType", "application/json");
+                  body.add("generationConfig", gc);
+          
+                  JsonObject res = post(key, model, body);
+                  StringBuilder sb = new StringBuilder();
+                  for (JsonElement e : parts(res)) {
+                      JsonObject p = e.getAsJsonObject();
+                      if (p.has("text") && !(p.has("thought") && p.get("thought").getAsBoolean()))
+                          sb.append(p.get("text").getAsString());
+                  }
+                  JsonObject j = JsonParser.parseString(sb.toString().trim()).getAsJsonObject();
+                  String heard = j.has("heard") ? j.get("heard").getAsString() : (userText == null ? "..." : userText);
+                  return new String[]{heard, j.get("reply").getAsString()};
+              }
+          
+              public static void speak(String key, String ttsModel, String text) throws Exception {
+                  JsonObject body = new JsonObject();
+                  body.add("contents", new JsonArray());
+                  body.getAsJsonArray("contents").add(content(null, textPart(text)));
+                  JsonObject voice = new JsonObject();
+                  voice.addProperty("voiceName", "Kore");
+                  JsonObject vc = new JsonObject();
+                  vc.add("prebuiltVoiceConfig", voice);
+                  JsonObject sc = new JsonObject();
+                  sc.add("voiceConfig", vc);
+                  JsonObject gc = new JsonObject();
+                  JsonArray mods = new JsonArray();
+                  mods.add("AUDIO");
+                  gc.add("responseModalities", mods);
+                  gc.add("speechConfig", sc);
+                  body.add("generationConfig", gc);
+          
+                  JsonObject res = post(key, ttsModel, body);
+                  String b64 = null;
+                  for (JsonElement e : parts(res)) {
+                      JsonObject p = e.getAsJsonObject();
+                      if (p.has("inlineData")) b64 = p.getAsJsonObject("inlineData").get("data").getAsString();
+                  }
+                  if (b64 == null) throw new RuntimeException("Ses verisi gelmedi");
+                  byte[] pcm = Base64.getDecoder().decode(b64);
+                  AudioFormat fmt = new AudioFormat(24000f, 16, 1, true, false);
+                  Clip clip = AudioSystem.getClip();
+                  clip.open(fmt, pcm, 0, pcm.length);
+                  clip.start();
+              }
+          }
+          NPCEOF
+          mkdir -p $(dirname src/main/java/com/orhan/npcmod/NpcMod.java)
+          cat > src/main/java/com/orhan/npcmod/NpcMod.java <<'NPCEOF'
+          package com.orhan.npcmod;
+          
+          import com.mojang.brigadier.arguments.StringArgumentType;
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.event.player.UseEntityCallback;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.entity.passive.VillagerEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.ActionResult;
+          import net.minecraft.util.Hand;
+          import org.lwjgl.glfw.GLFW;
+          
+          import java.io.*;
+          import java.nio.file.*;
+          import java.util.*;
+          
+          public class NpcMod implements ClientModInitializer {
+              static final String NAME = "AI NPC";
+              static KeyBinding talkKey;
+              static boolean chatOn = false, recording = false;
+              static final List<String[]> history = new ArrayList<>();
+              static final Properties props = new Properties();
+              static Path cfg;
+          
+              static void say(String s) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.execute(() -> { if (mc.player != null) mc.player.sendMessage(Text.literal(s), false); });
+              }
+          
+              static void bar(String s) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  mc.execute(() -> { if (mc.player != null) mc.player.sendMessage(Text.literal(s), true); });
+              }
+          
+              static void save() {
+                  try (OutputStream o = Files.newOutputStream(cfg)) { props.store(o, "npcmod"); } catch (Exception ignored) {}
+              }
+          
+              static String key() { return props.getProperty("token", ""); }
+              static String lang() { return props.getProperty("lang", "Türkçe"); }
+              static String model() { return props.getProperty("model", "gemini-flash-latest"); }
+              static String ttsModel() { return props.getProperty("ttsmodel", "gemini-3.1-flash-tts-preview"); }
+          
+              static void ask(String userText, byte[] wav) {
+                  new Thread(() -> {
+                      try {
+                          if (key().isEmpty()) { say("§cÖnce /npc token <gemini anahtarı> yaz."); return; }
+                          bar("NPC düşünüyor...");
+                          String[] r = Gemini.chat(key(), model(), lang(), history, userText, wav);
+                          history.add(new String[]{"user", r[0]});
+                          history.add(new String[]{"model", r[1]});
+                          say("§7<Sen> " + r[0]);
+                          say("§b<" + NAME + "> §f" + r[1]);
+                          try { Gemini.speak(key(), ttsModel(), r[1]); }
+                          catch (Throwable e) { say("§eSes çalınamadı: " + e.getMessage()); }
+                      } catch (Throwable e) {
+                          say("§cHata: " + e.getMessage());
+                      }
+                  }).start();
+              }
+          
+              static void handleAudio(byte[] pcm) {
+                  try {
+                      if (pcm.length < 16000) { bar("Çok kısa, tekrar dene"); return; }
+                      ask(null, Recorder.wav(pcm));
+                  } catch (Throwable e) {
+                      say("§cHata: " + e.getMessage());
+                  }
+              }
+          
+              @Override
+              public void onInitializeClient() {
+                  cfg = FabricLoader.getInstance().getConfigDir().resolve("npcmod.properties");
+                  try (InputStream i = Files.newInputStream(cfg)) { props.load(i); } catch (Exception ignored) {}
+          
+                  talkKey = KeyBindingHelper.registerKeyBinding(
+                          new KeyBinding("key.npcmod.talk", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_V, "category.npcmod"));
+          
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                      dispatcher.register(ClientCommandManager.literal("npc")
+                          .then(ClientCommandManager.literal("create").executes(c -> {
+                              MinecraftClient mc = MinecraftClient.getInstance();
+                              mc.player.networkHandler.sendChatCommand("summon villager ~ ~ ~ {NoAI:1b,Invulnerable:1b,Silent:1b,PersistenceRequired:1b,CustomNameVisible:1b,CustomName:'{\"text\":\"" + NAME + "\",\"color\":\"aqua\"}'}");
+                              say("§aNPC oluşturuldu. Sağ tıkla!");
+                              return 1;
+                          }))
+                          .then(ClientCommandManager.literal("token").then(
+                              ClientCommandManager.argument("anahtar", StringArgumentType.word()).executes(c -> {
+                                  props.setProperty("token", StringArgumentType.getString(c, "anahtar"));
+                                  save();
+                                  say("§aGemini anahtarı kaydedildi.");
+                                  return 1;
+                              })))
+                          .then(ClientCommandManager.literal("lang").then(
+                              ClientCommandManager.argument("dil", StringArgumentType.greedyString()).executes(c -> {
+                                  props.setProperty("lang", StringArgumentType.getString(c, "dil").trim());
+                                  save();
+                                  history.clear();
+                                  say("§aDil: " + lang());
+                                  return 1;
+                              })))
+                          .then(ClientCommandManager.literal("chat")
+                              .executes(c -> {
+                                  chatOn = !chatOn;
+                                  say(chatOn ? "§aSohbet açık. V'ye basılı tutup konuş." : "§7Sohbet kapalı.");
+                                  return 1;
+                              })
+                              .then(ClientCommandManager.argument("mesaj", StringArgumentType.greedyString()).executes(c -> {
+                                  ask(StringArgumentType.getString(c, "mesaj"), null);
+                                  return 1;
+                              })))));
+          
+                  UseEntityCallback.EVENT.register((player, world, hand, entity, hit) -> {
+                      if (world.isClient && hand == Hand.MAIN_HAND && entity instanceof VillagerEntity
+                              && entity.hasCustomName() && entity.getCustomName().getString().equals(NAME)) {
+                          chatOn = true;
+                          say("§aNPC ile sohbet açıldı. V'ye basılı tutup konuş veya /npc chat <yazı>");
+                          return ActionResult.SUCCESS;
+                      }
+                      return ActionResult.PASS;
+                  });
+          
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      if (mc.player == null) return;
+                      boolean down = chatOn && mc.currentScreen == null && talkKey.isPressed();
+                      if (down && !recording) {
+                          if (key().isEmpty()) { bar("Önce /npc token yaz"); return; }
+                          if (Recorder.start()) recording = true;
+                          else bar("Mikrofon açılamadı. /npc chat <yazı> kullan");
+                      }
+                      if (down && recording) bar("● Kayıt ediliyor...");
+                      if (!down && recording) {
+                          recording = false;
+                          handleAudio(Recorder.stop());
+                      }
+                  });
+              }
+          }
+          NPCEOF
+      - run: gradle build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npcmod
+          path: build/libs/npcmod-1.0.0.jar
